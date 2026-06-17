@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Asset Viewer</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #1a1a2e; font-family: monospace; }
+  canvas { display: block; }
+  #ui { position: fixed; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.7); padding: 12px; border-radius: 8px; color: #eee; }
+  #ui select, #ui button { font-family: monospace; font-size: 14px; padding: 4px 8px; margin: 2px; }
+  #info { position: fixed; bottom: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.7); padding: 8px; border-radius: 8px; color: #aaa; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label>Asset: <select id="assetSelect"></select></label>
+  <br/>
+  <label>Scale: <input type="range" id="scaleSlider" min="1" max="6" step="0.1" value="3.5" /></label>
+  <span id="scaleVal">3.5</span>
+  <br/>
+  <button id="resetCam">Reset Camera</button>
+</div>
+<div id="info">Drag to orbit · Scroll to zoom · Right-drag to pan</div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { createCardboardBox } from "../src/assets/cardboardBox.ts";
+import { createCouch } from "../src/assets/couch.ts";
+import { createCoffeeTable } from "../src/assets/coffeeTable.ts";
+import { createWoodenChair } from "../src/assets/woodenChair.ts";
+import { createBookStack } from "../src/assets/bookStack.ts";
+import { createShoe } from "../src/assets/shoe.ts";
+import { createToyBlock } from "../src/assets/toyBlock.ts";
+import { createPencil } from "../src/assets/pencil.ts";
+import { createFloorLamp } from "../src/assets/floorLamp.ts";
+import { createRug } from "../src/assets/rug.ts";
+import { createBaseboard } from "../src/assets/baseboard.ts";
+import { createCerealCrumbs } from "../src/assets/cerealCrumbs.ts";
+import { createTvOnStand } from "../src/assets/tvOnStand.ts";
+
+const factories = {
+  cardboardBox: () => createCardboardBox({ seed: 42 }),
+  cardboardBoxSealed: () => createCardboardBox({ seed: 42, sealed: true }),
+  couch: () => createCouch({ seed: 42 }),
+  coffeeTable: () => createCoffeeTable({ seed: 42 }),
+  woodenChair: () => createWoodenChair({ seed: 42 }),
+  bookStack: () => createBookStack({ seed: 42 }),
+  shoe: () => createShoe({ seed: 42 }),
+  toyBlock: () => createToyBlock({ seed: 42 }),
+  pencil: () => createPencil({ seed: 42 }),
+  pencilUpright: () => createPencil({ seed: 42, upright: true }),
+  floorLamp: () => createFloorLamp({ seed: 42 }),
+  rug: () => createRug({ seed: 42 }),
+  baseboard: () => createBaseboard({ seed: 42 }),
+  cerealCrumbs: () => createCerealCrumbs({ seed: 42 }),
+  tvOnStand: () => createTvOnStand({ seed: 42 }),
+  tvOnStandOff: () => createTvOnStand({ seed: 42, off: true }),
+  tvOnStandStatic: () => createTvOnStand({ seed: 42, static: true }),
+};
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.Fog(0x1a1a2e, 50, 120);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(12, 10, 12);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 2, 0);
+
+// Lights
+const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambient);
+const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+sun.position.set(10, 20, 8);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 0.5;
+sun.shadow.camera.far = 60;
+sun.shadow.camera.left = -20;
+sun.shadow.camera.right = 20;
+sun.shadow.camera.top = 20;
+sun.shadow.camera.bottom = -20;
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0x8899ff, 0.3);
+fill.position.set(-8, 6, -5);
+scene.add(fill);
+
+// Floor grid
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(60, 60),
+  new THREE.MeshStandardMaterial({ color: 0x3a3a4e, roughness: 0.9 })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+const grid = new THREE.GridHelper(60, 60, 0x555566, 0x333344);
+scene.add(grid);
+
+// Asset container
+let currentAsset = null;
+let currentScale = 3.5;
+
+function loadAsset(name) {
+  if (currentAsset) {
+    scene.remove(currentAsset);
+    currentAsset.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+  }
+  currentAsset = factories[name]();
+  currentAsset.scale.setScalar(currentScale);
+  scene.add(currentAsset);
+}
+
+// Populate dropdown
+const select = document.getElementById("assetSelect");
+for (const name of Object.keys(factories)) {
+  const opt = document.createElement("option");
+  opt.value = name;
+  opt.textContent = name;
+  select.appendChild(opt);
+}
+select.value = "cardboardBox";
+select.addEventListener("change", () => loadAsset(select.value));
+loadAsset("cardboardBox");
+
+// Scale slider
+const slider = document.getElementById("scaleSlider");
+const scaleVal = document.getElementById("scaleVal");
+slider.addEventListener("input", () => {
+  currentScale = parseFloat(slider.value);
+  scaleVal.textContent = currentScale.toFixed(1);
+  if (currentAsset) currentAsset.scale.setScalar(currentScale);
+});
+
+// Reset camera
+document.getElementById("resetCam").addEventListener("click", () => {
+  camera.position.set(12, 10, 12);
+  controls.target.set(0, 2, 0);
+  controls.update();
+});
+
+// Resize
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Animate
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>TV on Stand — Asset Viewer</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #1a1a2e; font-family: monospace; }
+  canvas { display: block; }
+  #info { position: fixed; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.7);
+          padding: 10px; border-radius: 8px; color: #eee; font-size: 13px; }
+  #info b { color: #ffd700; }
+</style>
+</head>
+<body>
+<div id="info">
+  <b>TV on Stand</b><br/>
+  Drag to orbit · Scroll to zoom<br/>
+  Scale: <input type="range" id="scale" min="1" max="6" step="0.1" value="3.5" />
+  <span id="sv">3.5</span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { createTvOnStand } from './src/assets/tvOnStand.ts';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x12121f);
+scene.fog = new THREE.Fog(0x12121f, 30, 80);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 200);
+camera.position.set(8, 6, 10);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 3, 0);
+
+// Lighting — dim ambient so the TV screen glow pops
+const amb = new THREE.AmbientLight(0x4466aa, 0.25);
+scene.add(amb);
+const sun = new THREE.DirectionalLight(0xffeedd, 0.5);
+sun.position.set(6, 14, 4);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 40;
+sun.shadow.camera.left = -12;
+sun.shadow.camera.right = 12;
+sun.shadow.camera.top = 12;
+sun.shadow.camera.bottom = -12;
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0x8899ff, 0.2);
+fill.position.set(-5, 4, -3);
+scene.add(fill);
+
+// Floor — wood-tone
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(40, 40),
+  new THREE.MeshStandardMaterial({ color: 0x4a3a2a, roughness: 0.85 })
+);
+floor.rotation.x = -Math.PI/2;
+floor.receiveShadow = true;
+scene.add(floor);
+const grid = new THREE.GridHelper(40, 40, 0x444466, 0x222233);
+grid.position.y = 0.01;
+scene.add(grid);
+
+// Create TV
+let tv = createTvOnStand({ seed: 42 });
+tv.scale.setScalar(3.5);
+scene.add(tv);
+
+// Expose for console inspection
+window.__tv = tv;
+window.__THREE = THREE;
+
+// Scale slider
+const slider = document.getElementById('scale');
+const sv = document.getElementById('sv');
+slider.addEventListener('input', () => {
+  const s = parseFloat(slider.value);
+  sv.textContent = s.toFixed(1);
+  tv.scale.setScalar(s);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>

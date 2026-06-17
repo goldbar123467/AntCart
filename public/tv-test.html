@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head><title>TV Test</title></head>
+<body>
+<div id="status">Loading...</div>
+<div id="err" style="color:red;white-space:pre-wrap;font-family:monospace;"></div>
+<script type="module">
+const status = document.getElementById('status');
+const err = document.getElementById('err');
+try {
+  status.textContent = 'Importing three...';
+  const THREE = await import('three');
+  status.textContent = 'Importing TV factory...';
+  const { createTvOnStand } = await import('../src/assets/tvOnStand.ts');
+  status.textContent = 'Creating TV...';
+  const tv = createTvOnStand({ seed: 42 });
+  status.textContent = 'TV created! Children: ' + tv.children.length;
+  
+  // Quick render
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x222233);
+  const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 200);
+  camera.position.set(10, 8, 12);
+  camera.lookAt(0, 2, 0);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  document.body.appendChild(renderer.domElement);
+  
+  const amb = new THREE.AmbientLight(0xffffff, 0.4);
+  scene.add(amb);
+  const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+  sun.position.set(8, 15, 6);
+  sun.castShadow = true;
+  scene.add(sun);
+  
+  // Floor
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(40, 40),
+    new THREE.MeshStandardMaterial({ color: 0x3a3a4e })
+  );
+  floor.rotation.x = -Math.PI/2;
+  floor.receiveShadow = true;
+  scene.add(floor);
+  
+  scene.add(tv);
+  tv.scale.setScalar(3.5);
+  
+  renderer.render(scene, camera);
+  status.textContent = 'Rendered! Children: ' + tv.children.length;
+} catch (e) {
+  err.textContent = e.stack || e.message || String(e);
+  status.textContent = 'FAILED';
+}
+</script>
+</body>
+</html>

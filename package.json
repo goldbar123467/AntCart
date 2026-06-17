@@ -1,0 +1,24 @@
+{
+  "name": "ant-carts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5174",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4174",
+    "test": "vitest run",
+    "qa:visual": "node scripts/visual-qa.mjs",
+    "check": "npm run test && npm run build"
+  },
+  "dependencies": {
+    "cannon-es": "^0.20.0",
+    "three": "^0.176.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.176.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.1.4"
+  }
+}
