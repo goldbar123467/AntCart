@@ -12,6 +12,7 @@ import {
 import { createRaceState } from "./game/raceState";
 import { getSpeedGaugeState } from "./game/speedGauge";
 import { buildClosedCurbCurve, buildCurbPathPoints } from "./game/trackCurbs";
+import { createFinishLineGroup } from "./game/finishLine";
 import { buildRoadSurfaceGeometry } from "./game/trackSurface";
 import {
   buildTrackLayout,
@@ -943,22 +944,7 @@ function addLaneDashes(points: readonly THREE.Vector3[]): void {
 }
 
 function addStartLine(points: readonly THREE.Vector3[]): void {
-  const a = points[0];
-  const b = points[1];
-  const tangent = new THREE.Vector3().subVectors(b, a).normalize();
-  const normal = new THREE.Vector3(-tangent.z, 0, tangent.x);
-
-  for (let stripeIndex = -2; stripeIndex <= 2; stripeIndex += 1) {
-    const startStripe = new THREE.Mesh(
-      new THREE.BoxGeometry(1.15, 0.04, 5.4),
-      stripeIndex % 2 === 0 ? matKartWhite : matKartBlack,
-    );
-    startStripe.position.copy(a).addScaledVector(normal, stripeIndex * 1.35);
-    startStripe.position.y = 0.12;
-    startStripe.rotation.y = Math.atan2(tangent.x, tangent.z) + Math.PI / 2;
-    startStripe.receiveShadow = true;
-    scene.add(startStripe);
-  }
+  scene.add(createFinishLineGroup(points[0], points[1], roadWidth));
 }
 
 function makeTrackPickups(curve: THREE.CatmullRomCurve3, lapLength: number): void {
