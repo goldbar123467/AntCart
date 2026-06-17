@@ -39,8 +39,8 @@ async function assertServerReachable() {
 }
 
 async function captureScreenshot(page, screenshots, label) {
-  const path = resolve(outputDir, `visual-qa-${stamp}-${label}.png`);
-  await page.screenshot({ path, fullPage: false });
+  const path = resolve(outputDir, `visual-qa-${stamp}-${label}.jpg`);
+  await page.screenshot({ path, fullPage: false, type: "jpeg", quality: 78 });
   screenshots.push(path);
 }
 
@@ -50,10 +50,14 @@ async function readPageState(page) {
     const gaugeText =
       document.querySelector(".speed-gauge")?.textContent?.replace(/\s+/g, " ").trim() ?? null;
     const canvasRect = document.querySelector("canvas")?.getBoundingClientRect();
+    const activeScreens = [...document.querySelectorAll(".ac-screen.is-active")]
+      .map((node) => [...node.classList].filter((name) => name !== "ac-screen" && name !== "is-active"))
+      .flat();
 
     return {
       debug,
       gaugeText,
+      activeScreens,
       viewport: {
         width: window.innerWidth,
         height: window.innerHeight,
@@ -72,17 +76,45 @@ async function readPageState(page) {
 }
 
 async function holdKeys(page, keys, durationMs) {
-  await focusGamePage(page);
+  await page.evaluate((codes) => {
+    const keyForCode = (code) => {
+      if (code === "KeyW") return "w";
+      if (code === "KeyA") return "a";
+      if (code === "KeyS") return "s";
+      if (code === "KeyD") return "d";
+      return code;
+    };
 
-  for (const key of keys) {
-    await page.keyboard.down(key);
-  }
+    for (const code of codes) {
+      const event = new KeyboardEvent("keydown", {
+        bubbles: true,
+        key: keyForCode(code),
+      });
+      Object.defineProperty(event, "code", { value: code });
+      window.dispatchEvent(event);
+    }
+  }, keys);
 
   await page.waitForTimeout(durationMs);
 
-  for (const key of [...keys].reverse()) {
-    await page.keyboard.up(key);
-  }
+  await page.evaluate((codes) => {
+    const keyForCode = (code) => {
+      if (code === "KeyW") return "w";
+      if (code === "KeyA") return "a";
+      if (code === "KeyS") return "s";
+      if (code === "KeyD") return "d";
+      return code;
+    };
+
+    for (const code of [...codes].reverse()) {
+      const event = new KeyboardEvent("keyup", {
+        bubbles: true,
+        key: keyForCode(code),
+      });
+      Object.defineProperty(event, "code", { value: code });
+      window.dispatchEvent(event);
+    }
+  }, keys);
 }
 
 async function focusGamePage(page) {
@@ -92,8 +124,27 @@ async function focusGamePage(page) {
   });
 }
 
+async function clickSelector(page, selector) {
+  const clicked = await page.evaluate((targetSelector) => {
+    const target = document.querySelector(targetSelector);
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+    target.click();
+    return true;
+  }, selector);
+
+  if (!clicked) {
+    throw new Error(`Could not click ${selector}`);
+  }
+}
+
 async function runScenario(browser, scenario) {
   console.log(`Visual QA: starting ${scenario.name}`);
+  const scenarioUrl = new URL(targetUrl);
+  scenarioUrl.searchParams.set("track", "toy-pretzel");
+  scenarioUrl.searchParams.set("seed", "1");
+  scenarioUrl.searchParams.delete("start");
   const context = await browser.newContext({
     viewport: scenario.viewport,
     deviceScaleFactor: scenario.deviceScaleFactor ?? 1,
@@ -112,7 +163,7 @@ async function runScenario(browser, scenario) {
     }
   });
 
-  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.goto(scenarioUrl.toString(), { waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForFunction(() => typeof window.antcartsDebug === "function", {
     timeout: 10000,
   });
@@ -121,19 +172,50 @@ async function runScenario(browser, scenario) {
     return value && value.textContent && value.getBoundingClientRect().width > 0;
   }, { timeout: 10000 });
   await focusGamePage(page);
-  await page.waitForTimeout(500);
-  await captureScreenshot(page, screenshots, `${scenario.name}-start`);
+  await page.waitForFunction(() => window.antcartsDebug?.().phase === "menu", { timeout: 10000 });
+  await page.waitForTimeout(350);
+  await captureScreenshot(page, screenshots, `${scenario.name}-landing`);
+  const afterLanding = await readPageState(page);
+
+  await clickSelector(page, ".ac-start [data-action='tracks']");
+  await page.waitForFunction(() => {
+    return document.querySelector(".ac-track-select.is-active .ac-track-card") !== null;
+  }, { timeout: 10000 });
+  await captureScreenshot(page, screenshots, `${scenario.name}-track-select`);
+  const afterTrackSelect = await readPageState(page);
+
+  await clickSelector(page, ".ac-track-select [data-action='back']");
+  await page.waitForFunction(() => window.antcartsDebug?.().phase === "menu", { timeout: 10000 });
+
+  await clickSelector(page, ".ac-start [data-action='options']");
+  await page.waitForFunction(() => window.antcartsDebug?.().phase === "paused", { timeout: 10000 });
+  await captureScreenshot(page, screenshots, `${scenario.name}-options`);
+  const afterOptions = await readPageState(page);
+
+  await clickSelector(page, ".ac-pause [data-action='resume']");
+  await page.waitForFunction(() => window.antcartsDebug?.().phase === "menu", { timeout: 10000 });
+
+  await clickSelector(page, ".ac-start [data-action='start']");
+  await page.waitForFunction(() => window.antcartsDebug?.().phase === "race", { timeout: 10000 });
+  await page.waitForTimeout(350);
+  const afterRaceStart = await readPageState(page);
 
   await holdKeys(page, ["KeyW", "KeyA"], scenario.driveMs);
   await captureScreenshot(page, screenshots, `${scenario.name}-left-turn`);
   const afterLeftTurn = await readPageState(page);
 
-  await holdKeys(page, ["KeyW", "KeyD"], Math.round(scenario.driveMs * 0.8));
-  await captureScreenshot(page, screenshots, `${scenario.name}-right-turn`);
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => window.antcartsDebug?.().phase === "paused", { timeout: 10000 });
+  await captureScreenshot(page, screenshots, `${scenario.name}-paused-race`);
+  const afterPausedRace = await readPageState(page);
+
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => window.antcartsDebug?.().phase === "race", { timeout: 10000 });
+
+  await holdKeys(page, ["KeyW", "KeyD"], Math.round(scenario.driveMs * 0.75));
   const afterRightTurn = await readPageState(page);
 
-  await holdKeys(page, ["KeyW"], Math.round(scenario.driveMs * 0.55));
-  await captureScreenshot(page, screenshots, `${scenario.name}-straight-recovery`);
+  await holdKeys(page, ["KeyW"], Math.round(scenario.driveMs * 0.45));
   const afterRecovery = await readPageState(page);
 
   await context.close();
@@ -150,7 +232,12 @@ async function runScenario(browser, scenario) {
     viewport: scenario.viewport,
     screenshots,
     states: {
+      afterLanding,
+      afterTrackSelect,
+      afterOptions,
+      afterRaceStart,
       afterLeftTurn,
+      afterPausedRace,
       afterRightTurn,
       afterRecovery,
     },
@@ -208,7 +295,7 @@ try {
     await runScenario(browser, {
       name: "desktop",
       viewport: { width: 1365, height: 768 },
-      driveMs: 4200,
+      driveMs: 12000,
     }),
   );
   scenarios.push(
@@ -218,7 +305,7 @@ try {
       deviceScaleFactor: 2,
       isMobile: true,
       hasTouch: true,
-      driveMs: 5600,
+      driveMs: 12000,
     }),
   );
 } finally {
@@ -245,6 +332,26 @@ const failures = [];
 for (const scenario of scenarios) {
   if (scenario.maxSpeedMps < 4) {
     failures.push(`${scenario.name}: keyboard drive did not move the kart enough`);
+  }
+
+  if (scenario.states.afterLanding.debug?.phase !== "menu") {
+    failures.push(`${scenario.name}: landing did not start in menu phase`);
+  }
+
+  if (!scenario.states.afterTrackSelect.activeScreens.includes("ac-track-select")) {
+    failures.push(`${scenario.name}: track-select screen did not become active`);
+  }
+
+  if (scenario.states.afterOptions.debug?.phase !== "paused") {
+    failures.push(`${scenario.name}: options screen did not enter paused phase`);
+  }
+
+  if (scenario.states.afterRaceStart.debug?.phase !== "race") {
+    failures.push(`${scenario.name}: Start Race did not enter race phase`);
+  }
+
+  if (scenario.states.afterPausedRace.debug?.phase !== "paused") {
+    failures.push(`${scenario.name}: Escape did not pause during race`);
   }
 
   if (scenario.pageErrors.length > 0) {

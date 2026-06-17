@@ -13,12 +13,51 @@ import { createRaceState } from "./game/raceState";
 import { getSpeedGaugeState } from "./game/speedGauge";
 import { buildClosedCurbCurve, buildCurbPathPoints } from "./game/trackCurbs";
 import { buildRoadSurfaceGeometry } from "./game/trackSurface";
-import { buildTrackLayout, type TrackLayoutSection } from "./game/trackTemplates";
+import {
+  buildTrackLayout,
+  TRACK_TEMPLATES,
+  type TrackLayoutSection,
+  type TrackTemplateId,
+} from "./game/trackTemplates";
 import { TRACK_RAIL_CONFIG } from "./game/trackVisualConfig";
 import { computeAssetPlacements, type TrackInfo } from "./game/assetPlacement";
 import { spawnPlacedAssets } from "./render/assetSpawner";
 import { createRoomMaterials } from "./render/roomMaterials";
 import type { InputState } from "./game/types";
+import { createScreenManager, type GamePhase } from "./ui/screens/screenManager";
+import { createStartScreen } from "./ui/screens/startScreen";
+import { createResultsScreen, computeCoinsEarned, type ResultsData } from "./ui/screens/resultsScreen";
+import {
+  createBetweenRacesScreen,
+  type StandingRow,
+} from "./ui/screens/betweenRacesScreen";
+import { createStoreScreen } from "./ui/screens/storeScreen";
+import { addCoins } from "./game/economy/currency";
+import { getPowerupStock } from "./game/economy/inventory";
+import {
+  createPowerupRunner,
+  type PowerupContext,
+  type PowerupRuntimeDelta,
+} from "./game/powerups/powerupRunner";
+import {
+  POWERUP_IDS,
+  type PowerupId,
+} from "./game/powerups/powerupCatalog";
+import { createPowerupHud, type PowerupHud } from "./ui/hud/powerupHud";
+import { createPauseScreen, type PauseScreen } from "./ui/screens/pauseScreen";
+import {
+  createTrackSelectScreen,
+  type TrackSelectScreen,
+  type TrackPreviewKind,
+  type TrackVariantInfo,
+} from "./ui/screens/trackSelectScreen";
+import {
+  createAchievementToaster,
+  tryUnlockAndToast,
+  type AchievementToaster,
+} from "./ui/hud/achievements";
+import { loadSettings, updateSettings, type GameSettings } from "./game/settings";
+import { loadInventory } from "./game/economy/inventory";
 import "./style.css";
 
 interface Checkpoint {
@@ -31,6 +70,7 @@ interface EngineAudio {
   start: () => Promise<void>;
   update: (speedRatio: number) => void;
   isRunning: () => boolean;
+  setMuted: (muted: boolean) => void;
 }
 
 interface AiRacer {
@@ -120,9 +160,10 @@ sunLight.shadow.radius = 4;
 sunLight.shadow.blurSamples = 12;
 scene.add(sunLight);
 
+const trackTemplateId = getRaceTrackTemplateId();
 const seed = getRaceSeed();
 
-console.log(`Race seed: ${seed}`);
+console.log(`Race track: ${trackTemplateId}, seed: ${seed}`);
 
 const roomMaterials = createRoomMaterials(renderer);
 const matTrack = new THREE.MeshStandardMaterial({ color: 0x2d6bbf, roughness: 0.82 });
@@ -161,7 +202,7 @@ const matSunPatch = new THREE.MeshBasicMaterial({
   side: THREE.DoubleSide,
 });
 
-const trackLayout = buildTrackLayout("toy-pretzel", seed);
+const trackLayout = buildTrackLayout(trackTemplateId, seed);
 const roadWidth = trackLayout.roadWidth;
 const trackPoints = trackLayout.points;
 const trackCurve = new THREE.CatmullRomCurve3(trackPoints, true, "catmullrom", trackLayout.tension);
@@ -213,12 +254,215 @@ const speedGauge = createSpeedGauge();
 const controlsHint = createControlsHint();
 const audioButton = createAudioButton();
 const engineAudio = createEngineAudio();
+
+// --- Wave 4: Powerup runtime + HUD ---
+// The runner is the single source of truth for active effects and per-frame
+// multipliers. The HUD shows the player's selected powerup slot + active-effect
+// timers. Both are only shown during the "race" phase. The runner NEVER touches
+// kart physics — it communicates via PowerupContext + PowerupRuntimeDelta.
+const powerupRunner = createPowerupRunner();
+const powerupHud = createPowerupHud();
+document.body.appendChild(powerupHud.element);
+// Purely-visual shield bubble (NO Cannon-es body, NO effect on kart motion).
+const shieldBubble = new THREE.Mesh(
+  new THREE.SphereGeometry(1.6, 20, 14),
+  new THREE.MeshBasicMaterial({
+    color: 0x5dfdff,
+    transparent: true,
+    opacity: 0.22,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  }),
+);
+shieldBubble.visible = false;
+shieldBubble.name = "player-shield-bubble";
+kart.add(shieldBubble);
+let shieldActive = false;
+// The currently selected powerup id (null when nothing stocked). Q cycles, SPACE uses.
+let selectedPowerupId: PowerupId | null = pickDefaultSelectedPowerup();
+
+function pickDefaultSelectedPowerup(): PowerupId | null {
+  const stock = getPowerupStock();
+  for (const id of POWERUP_IDS) {
+    if ((stock[id] ?? 0) > 0) {
+      return id;
+    }
+  }
+  return null;
+}
+
+function refreshPowerupHud(): void {
+  const id = selectedPowerupId;
+  powerupHud.setSelected(id);
+  const stock = getPowerupStock();
+  powerupHud.setCount(id ? (stock[id] ?? 0) : 0);
+}
+refreshPowerupHud();
+
+// --- Wave 5: persistent settings + achievements toaster ---
+// Settings are read once at startup and re-applied whenever a toggle changes
+// in the pause/options panel. engineAudio mutes the engine loop; showHud
+// toggles the in-race HUD overlays; cameraShake is a flag (host-applied later).
+let gameSettings: GameSettings = loadSettings();
+const achievementToaster: AchievementToaster = createAchievementToaster();
+document.body.appendChild(achievementToaster.element);
+
+function applyGameSettings(): void {
+  engineAudio.setMuted(!gameSettings.engineAudio);
+  const hudVisible = gameSettings.showHud;
+  hud.style.display = hudVisible ? "" : "none";
+  minimap.style.display = hudVisible ? "" : "none";
+  speedGauge.style.display = hudVisible ? "" : "none";
+  // The powerup HUD is also phase-gated; only suppress when the setting is off.
+  if (!hudVisible) {
+    powerupHud.hide();
+  }
+  // cameraShake flag is read by updateCamera when present (no-op for now).
+}
+applyGameSettings();
+
 let score = 0;
 let raceTimeSeconds = 240;
 let raceFinished = false;
 let lastTime = performance.now();
 
 updateCamera(1);
+
+// --- Screen system: phase state machine + start/landing overlay ---
+// The race loop (physics, AI, timer) is gated on phase === "race" below, but
+// the renderer keeps drawing so the scene is visible behind the menu.
+const screenManager = createScreenManager();
+// Wave 5: track the phase the player was in before opening the pause overlay,
+// so Resume can return there (menu when paused from the front-end, race when
+// paused mid-race via Esc).
+let phaseBeforePause: GamePhase = "menu";
+const pauseScreen: PauseScreen = createPauseScreen({
+  onResume: () => {
+    screenManager.goto(phaseBeforePause);
+  },
+  onRestart: () => {
+    resetRaceForNextRace();
+    screenManager.goto("race");
+  },
+  onQuit: () => {
+    resetRaceForNextRace();
+    screenManager.goto("menu");
+  },
+  options: () => gameSettings,
+  setOptions: (patch) => {
+    gameSettings = updateSettings(patch);
+    applyGameSettings();
+  },
+});
+document.body.appendChild(pauseScreen);
+screenManager.register("paused", pauseScreen);
+
+const trackVariantRoutes = buildTrackVariantRoutes();
+const trackRouteById = new Map(trackVariantRoutes.map((route) => [route.info.id, route]));
+const trackSelectScreen: TrackSelectScreen = createTrackSelectScreen({
+  onSelect: startSelectedTrack,
+  onBack: () => {
+    screenManager.goto("menu");
+  },
+});
+trackSelectScreen.setVariants(trackVariantRoutes.map((route) => route.info));
+document.body.appendChild(trackSelectScreen);
+screenManager.register("trackSelect", trackSelectScreen);
+
+const startScreen = createStartScreen({
+  onStart: () => {
+    screenManager.goto("race");
+  },
+  onStore: () => {
+    // Wave 3: store overlay is now registered below.
+    storeScreen.refresh();
+    checkInventoryAchievements();
+    screenManager.goto("store");
+  },
+  onOptions: () => {
+    // Wave 5: open the pause/options overlay. From the menu, Resume returns
+    // to the menu (phaseBeforePause stays "menu" until a race starts).
+    phaseBeforePause = screenManager.current;
+    pauseScreen.refresh();
+    screenManager.goto("paused");
+  },
+  onTracks: () => {
+    screenManager.goto("trackSelect");
+  },
+});
+document.body.appendChild(startScreen);
+screenManager.register("menu", startScreen);
+
+// --- Wave 2: Results + Between-Races overlays ---
+// Both reuse the start-screen reset helper. The "Store" buttons navigate to
+// the "store" phase; Wave 3 registers the actual store overlay (until then
+// ScreenManager hides every overlay for that phase — graceful no-op).
+const resultsScreen = createResultsScreen({
+  onContinue: () => {
+    resetRaceForNextRace();
+    betweenRacesScreen.setStandings(buildStandings());
+    screenManager.goto("betweenRaces");
+  },
+  onRetry: () => {
+    resetRaceForNextRace();
+    screenManager.goto("race");
+  },
+  onStore: () => {
+    // Wave 3: store overlay is now registered below.
+    storeScreen.refresh();
+    checkInventoryAchievements();
+    screenManager.goto("store");
+  },
+});
+document.body.appendChild(resultsScreen);
+screenManager.register("results", resultsScreen);
+
+const betweenRacesScreen = createBetweenRacesScreen({
+  onContinue: () => {
+    resetRaceForNextRace();
+    screenManager.goto("race");
+  },
+  onStore: () => {
+    // Wave 3: store overlay is now registered below.
+    storeScreen.refresh();
+    checkInventoryAchievements();
+    screenManager.goto("store");
+  },
+});
+document.body.appendChild(betweenRacesScreen);
+screenManager.register("betweenRaces", betweenRacesScreen);
+
+// --- Wave 3: Store overlay ---
+// Back returns to the menu. (Prior-phase tracking would be more invasive; the
+// menu is a safe hub from the store. The orchestrator may refine this later.)
+const storeScreen = createStoreScreen({
+  onBack: () => {
+    screenManager.goto("menu");
+  },
+});
+document.body.appendChild(storeScreen);
+screenManager.register("store", storeScreen);
+
+// Wave 4: show the powerup HUD only during the race phase.
+screenManager.setOnChange((phase) => {
+  if (phase === "race") {
+    selectedPowerupId = pickDefaultSelectedPowerup();
+    refreshPowerupHud();
+    if (gameSettings.showHud) {
+      powerupHud.show();
+    } else {
+      powerupHud.hide();
+    }
+  } else {
+    clearDrivingInput();
+    powerupHud.hide();
+    // Clear visual shield when leaving the race (effects stop ticking anyway).
+    shieldBubble.visible = false;
+    shieldActive = false;
+  }
+});
+
+screenManager.goto(shouldAutoStartRace() ? "race" : "menu");
 
 audioButton.addEventListener("click", () => {
   void startEngineAudio();
@@ -231,12 +475,18 @@ window.addEventListener("resize", resize);
 renderer.setAnimationLoop((time) => {
   const deltaSeconds = Math.min((time - lastTime) / 1000, 0.05);
   lastTime = time;
-  raceTimeSeconds = Math.max(0, raceTimeSeconds - deltaSeconds);
 
-  updateKart(deltaSeconds);
-  updateAiRacers(deltaSeconds);
-  updateBoostPads(deltaSeconds);
-  updateCheckpoints();
+  // Gate simulation/race logic on the race phase so menus pause the race.
+  // The render loop keeps running so the 3D scene stays visible behind menus.
+  if (screenManager.current === "race") {
+    raceTimeSeconds = Math.max(0, raceTimeSeconds - deltaSeconds);
+    updateKart(deltaSeconds);
+    updateAiRacers(deltaSeconds);
+    updateBoostPads(deltaSeconds);
+    updateCheckpoints();
+    updatePowerups(performance.now(), deltaSeconds);
+  }
+
   updateCamera(deltaSeconds);
   updateHud();
   updateMiniMap();
@@ -247,6 +497,7 @@ renderer.setAnimationLoop((time) => {
 
 (window as Window & {
   antcartsDebug?: () => {
+    phase: GamePhase;
     speedMps: number;
     heading: number;
     lapLengthMeters: number;
@@ -258,6 +509,7 @@ renderer.setAnimationLoop((time) => {
     position: { x: number; z: number };
   };
 }).antcartsDebug = () => ({
+  phase: screenManager.current,
   speedMps: Number(raceState.speed.toFixed(3)),
   heading: Number(playerHeading.toFixed(3)),
   lapLengthMeters: Number(lapLengthMeters.toFixed(1)),
@@ -281,6 +533,78 @@ function getRaceSeed(): number {
   }
 
   return Math.floor(Math.random() * 999_999);
+}
+
+function getRaceTrackTemplateId(): TrackTemplateId {
+  const trackParam = new URLSearchParams(window.location.search).get("track");
+
+  if (trackParam && Object.prototype.hasOwnProperty.call(TRACK_TEMPLATES, trackParam)) {
+    return trackParam as TrackTemplateId;
+  }
+
+  return "toy-pretzel";
+}
+
+function shouldAutoStartRace(): boolean {
+  return new URLSearchParams(window.location.search).get("start") === "1";
+}
+
+interface TrackVariantRoute {
+  info: TrackVariantInfo;
+  templateId: TrackTemplateId;
+  seed: number;
+}
+
+function buildTrackVariantRoutes(): TrackVariantRoute[] {
+  return (Object.entries(TRACK_TEMPLATES) as Array<[TrackTemplateId, (typeof TRACK_TEMPLATES)[TrackTemplateId]]>)
+    .flatMap(([templateId, template]) => template.variants.map((variant, index) => ({
+      templateId,
+      seed: index + 1,
+      info: {
+        id: `${templateId}:${variant.id}`,
+        name: `${template.name}: ${humanizeTrackVariant(variant.id)}`,
+        kind: getPreviewKindForVariant(variant.id, index),
+      },
+    })));
+}
+
+function startSelectedTrack(routeId: string): void {
+  const route = trackRouteById.get(routeId);
+
+  if (!route) {
+    return;
+  }
+
+  const nextUrl = new URL(window.location.href);
+  nextUrl.searchParams.set("track", route.templateId);
+  nextUrl.searchParams.set("seed", String(route.seed));
+  nextUrl.searchParams.set("start", "1");
+  window.location.assign(nextUrl.toString());
+}
+
+function humanizeTrackVariant(id: string): string {
+  return id
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function getPreviewKindForVariant(id: string, index: number): TrackPreviewKind {
+  if (id.includes("kidney") || id.includes("peanut") || id.includes("hourglass")) {
+    return "kidney";
+  }
+  if (id.includes("switchback") || id.includes("kink")) {
+    return "switchback";
+  }
+  if (id.includes("sweep") || id.includes("arc")) {
+    return "wide-S";
+  }
+  if (id.includes("dogleg") || id.includes("offset")) {
+    return "dogleg";
+  }
+
+  const fallback: TrackPreviewKind[] = ["loop", "dogleg", "kidney", "switchback", "wide-S"];
+  return fallback[index % fallback.length];
 }
 
 function createToyRoom(): void {
@@ -680,10 +1004,147 @@ function addAntLeg(group: THREE.Group, x: number, z: number, rotationY: number):
 }
 
 function handleKeyDown(event: KeyboardEvent): void {
+  if (event.code === "Escape") {
+    event.preventDefault();
+    togglePause();
+    return;
+  }
+
+  if (screenManager.current !== "race") {
+    return;
+  }
+
   setKey(event.code, true);
 
   if (isDrivingKey(event.code) && !engineAudio.isRunning()) {
     void startEngineAudio();
+  }
+
+  // Wave 4: powerup controls only during the race phase.
+  if (screenManager.current === "race") {
+    if (event.code === "Space") {
+      activateSelectedPowerup();
+    } else if (event.code === "KeyQ") {
+      cycleSelectedPowerup();
+    }
+  }
+}
+
+function togglePause(): void {
+  if (screenManager.current === "paused") {
+    screenManager.goto(phaseBeforePause);
+    return;
+  }
+
+  if (screenManager.current === "race" || screenManager.current === "menu") {
+    phaseBeforePause = screenManager.current;
+    pauseScreen.refresh();
+    screenManager.goto("paused");
+  }
+}
+
+/** Activate the currently selected powerup via the runtime runner. */
+function activateSelectedPowerup(): void {
+  if (selectedPowerupId === null) {
+    return;
+  }
+  const now = performance.now();
+  const activatedPowerupId = selectedPowerupId;
+  const ctx = makePowerupContext();
+  const result = powerupRunner.activate(activatedPowerupId, now, ctx);
+  if (!result.ok) {
+    // Out of stock — drop selection and re-pick the next available item.
+    selectedPowerupId = pickDefaultSelectedPowerup();
+  } else if (activatedPowerupId === "powerup-sugar-cube-boost") {
+    unlockAchievement("sugar-rush");
+  } else if (activatedPowerupId === "powerup-leaf-shield") {
+    unlockAchievement("formic-defender");
+  }
+  // Instant offense effects return a spawn request the host may render.
+  // Wave 4: no projectile rendering yet — consume + toast only.
+  refreshPowerupHud();
+}
+
+/** Cycle the selected powerup to the next stocked item (Q). */
+function cycleSelectedPowerup(): void {
+  const stock = getPowerupStock();
+  const haveStock = POWERUP_IDS.filter((id) => (stock[id] ?? 0) > 0);
+  if (haveStock.length === 0) {
+    selectedPowerupId = null;
+    refreshPowerupHud();
+    return;
+  }
+  if (selectedPowerupId === null) {
+    selectedPowerupId = haveStock[0];
+  } else {
+    const idx = haveStock.indexOf(selectedPowerupId);
+    selectedPowerupId = haveStock[(idx + 1) % haveStock.length];
+  }
+  refreshPowerupHud();
+}
+
+/** Build the PowerupContext from current race state (no kart physics access). */
+function makePowerupContext(): PowerupContext {
+  return {
+    playerSpeed: raceState.speed,
+    playerMaxSpeed: vehicleConfig.boostSpeed,
+    aiRacers,
+    score,
+    // Hook the runner to the EXISTING boost pathway: when a boost effect is
+    // active, nudge boostTimer so stepArcadeKart clamps to boostSpeed. This
+    // does NOT add a physics body or modify arcadeKart.ts.
+    applyPlayerBoost: (multiplier: number) => {
+      if (multiplier > 1) {
+        boostTimer = Math.max(boostTimer, 0.1);
+      }
+    },
+  };
+}
+
+/**
+ * Wave 4 per-frame powerup tick. Reads runner deltas and applies them to
+ * EXISTING race state (boost pathway, AI speeds, score, shield flag). The
+ * shield bubble is a purely visual Three.js mesh — NO Cannon-es body.
+ */
+function updatePowerups(now: number, deltaSeconds: number): void {
+  const ctx = makePowerupContext();
+  const delta: PowerupRuntimeDelta = powerupRunner.update(now, ctx);
+
+  // Player boost: re-nudge boostTimer each frame while a boost effect is active
+  // so the existing boost clamp in stepArcadeKart keeps the kart at boostSpeed.
+  if (delta.playerSpeedMultiplier > 1) {
+    boostTimer = Math.max(boostTimer, 0.12);
+  }
+
+  // AI slow: scale each AI racer's speed this frame (no physics body change).
+  if (delta.aiSpeedMultiplier < 1) {
+    for (const racer of aiRacers) {
+      racer.speed *= delta.aiSpeedMultiplier;
+    }
+  }
+
+  // Score bonus (magnet accrual).
+  if (delta.scoreBonus > 0) {
+    score += delta.scoreBonus * deltaSeconds;
+  }
+
+  // Shield flag + visual bubble.
+  shieldActive = delta.shieldActive;
+  shieldBubble.visible = shieldActive;
+
+  // Refresh HUD active-effect chips.
+  powerupHud.setActiveEffects(powerupRunner.getActive(), now);
+}
+
+function unlockAchievement(id: string): void {
+  tryUnlockAndToast(achievementToaster, id);
+}
+
+function checkInventoryAchievements(): void {
+  const inventory = loadInventory();
+
+  if (inventory.ownedCosmetics.length >= 5) {
+    unlockAchievement("hoarder");
   }
 }
 
@@ -717,6 +1178,13 @@ function setKey(code: string, pressed: boolean): void {
       input.right = pressed;
       break;
   }
+}
+
+function clearDrivingInput(): void {
+  input.forward = false;
+  input.backward = false;
+  input.left = false;
+  input.right = false;
 }
 
 function getKartForwardVector(): THREE.Vector3 {
@@ -859,6 +1327,7 @@ function updateCheckpoints(): void {
       if (raceState.lap >= totalRaceLaps) {
         raceFinished = true;
         raceState.speed = Math.min(raceState.speed, vehicleConfig.maxSpeed);
+        finishRace();
       }
 
       for (const checkpoint of checkpoints) {
@@ -1077,6 +1546,7 @@ function createEngineAudio(): EngineAudio {
   let oscillator: OscillatorNode | undefined;
   let gain: GainNode | undefined;
   let running = false;
+  let muted = false;
 
   return {
     start: async () => {
@@ -1101,9 +1571,15 @@ function createEngineAudio(): EngineAudio {
 
       const now = context.currentTime;
       oscillator.frequency.linearRampToValueAtTime(70 + speedRatio * 220, now + 0.05);
-      gain.gain.linearRampToValueAtTime(0.02 + speedRatio * 0.08, now + 0.05);
+      // When muted (engineAudio setting off), keep the gain silent. The
+      // oscillator keeps running so un-muting is instantaneous.
+      const targetGain = muted ? 0.0001 : 0.02 + speedRatio * 0.08;
+      gain.gain.linearRampToValueAtTime(targetGain, now + 0.05);
     },
     isRunning: () => running,
+    setMuted: (value: boolean) => {
+      muted = value;
+    },
   };
 }
 
@@ -1129,6 +1605,88 @@ function resize(): void {
   camera.updateProjectionMatrix();
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+/**
+ * Light race reset for "Next Race" / "Retry": restarts the timer, clears the
+ * finish flag, zeroes score/lap/checkpoint state, and moves the kart back to
+ * the start grid pose. Does NOT touch arcadeKart physics constants or the kart
+ * mesh — it only resets gameplay state + transform.
+ */
+function resetRaceForNextRace(): void {
+  raceFinished = false;
+  raceTimeSeconds = 240;
+  score = 0;
+  raceState.speed = 0;
+  raceState.lap = 0;
+  raceState.nextCheckpointIndex = 1;
+  boostTimer = 0;
+  // Wave 4: clear all active powerup effects (does NOT touch inventory).
+  powerupRunner.clear();
+  shieldActive = false;
+  shieldBubble.visible = false;
+  input.forward = false;
+  input.backward = false;
+  input.left = false;
+  input.right = false;
+  for (const checkpoint of checkpoints) {
+    checkpoint.passed = false;
+  }
+  for (const pad of boostPads) {
+    pad.cooldown = 0;
+  }
+  const pose = getStartGridPose(checkpointPoints);
+  kart.position.copy(pose.position);
+  playerHeading = pose.heading;
+  kart.rotation.y = playerHeading;
+  kart.rotation.z = 0;
+  kartDriveState = createArcadeKartState({ heading: playerHeading });
+}
+
+/**
+ * Build a placeholder standings bracket for the between-races screen. The
+ * player is listed first (finishing placement from the just-completed race);
+ * the rest are ant-named AI rivals with staged times. A full AI-placement
+ * system arrives in a later wave.
+ */
+function buildStandings(): StandingRow[] {
+  const names = [
+    "Worker-7",
+    "Scout-3",
+    "Forager-1",
+    "Soldier-9",
+    "Drone-4",
+    "Nurse-2",
+    "Replete-6",
+    "Major-5",
+  ];
+  return names.map((name, index) => ({
+    name: index === 0 ? "You" : name,
+    placement: index + 1,
+    time: 120 + index * 9,
+  }));
+}
+
+/** Transition to the results screen, awarding Crumb Coins for the run. */
+function finishRace(): void {
+  const elapsed = Math.max(0, 240 - raceTimeSeconds);
+  const data: ResultsData = {
+    time: elapsed,
+    score,
+    // The player always finishes 1st in the current single-player finish flow
+    // (the HUD reads "FINISH 1ST"). A real placement system arrives later.
+    placement: 1,
+    laps: totalRaceLaps,
+  };
+  const earned = computeCoinsEarned(data);
+  addCoins(earned);
+  unlockAchievement("first-crumb");
+  if (data.placement === 1) {
+    unlockAchievement("mandible");
+  }
+  checkInventoryAchievements();
+  resultsScreen.setResults(data);
+  screenManager.goto("results");
 }
 
 updateCamera();
