@@ -20,6 +20,14 @@ import {
   type TrackTemplateId,
 } from "./game/trackTemplates";
 import { TRACK_RAIL_CONFIG } from "./game/trackVisualConfig";
+import {
+  DEFAULT_ARCADE_PHYSICS_TUNING,
+  applyArcadeBodyVelocity,
+  buildRailColliderSpecs,
+  createAiKartBody,
+  createKartChassisBody,
+  resetBodyPose,
+} from "./game/kartPhysics";
 import { computeAssetPlacements, type TrackInfo } from "./game/assetPlacement";
 import { spawnPlacedAssets } from "./render/assetSpawner";
 import { createRoomMaterials } from "./render/roomMaterials";
@@ -33,6 +41,13 @@ import {
 } from "./ui/screens/betweenRacesScreen";
 import { createStoreScreen } from "./ui/screens/storeScreen";
 import { addCoins } from "./game/economy/currency";
+import {
+  createCoinPlacements,
+  createCoinStates,
+  resetCoinStates,
+  type CoinState,
+  MAX_COINS_PER_RACE,
+} from "./game/coinPickups";
 import { getPowerupStock } from "./game/economy/inventory";
 import {
   createPowerupRunner,
@@ -75,6 +90,7 @@ interface EngineAudio {
 
 interface AiRacer {
   group: THREE.Group;
+  body: CANNON.Body;
   progress: number;
   speed: number;
   laneOffset: number;
@@ -118,8 +134,18 @@ const staticPhysicsMaterial = new CANNON.Material("toy-room-static");
 const kartPhysicsMaterial = new CANNON.Material("ant-kart");
 physicsWorld.addContactMaterial(
   new CANNON.ContactMaterial(staticPhysicsMaterial, kartPhysicsMaterial, {
-    friction: 0.34,
-    restitution: 0.05,
+    friction: 0.18,
+    restitution: 0.22,
+    contactEquationStiffness: 2.5e6,
+    contactEquationRelaxation: 4,
+  }),
+);
+physicsWorld.addContactMaterial(
+  new CANNON.ContactMaterial(kartPhysicsMaterial, kartPhysicsMaterial, {
+    friction: 0.08,
+    restitution: 0.3,
+    contactEquationStiffness: 1.8e6,
+    contactEquationRelaxation: 5,
   }),
 );
 
@@ -138,6 +164,15 @@ const roomHalfDepth = 160;
 const roomWallHeight = 45;
 const totalRaceLaps = 3;
 const boostPads: BoostPad[] = [];
+
+// --- Crumb Coin pickups (up to 15 per race) ---
+interface CoinMesh {
+  mesh: THREE.Group;
+  disc: THREE.Mesh;
+}
+const coinStates: CoinState[] = createCoinStates(createCoinPlacements());
+const coinMeshes: CoinMesh[] = [];
+let coinsCollectedThisRace = 0;
 
 const ambientLight = new THREE.AmbientLight(0xfff3dc, 0.1);
 scene.add(ambientLight);
@@ -237,12 +272,15 @@ spawnPlacedAssets(assetPlacements, {
 const checkpoints = makeCheckpoints(checkpointPoints);
 const aiRacers = makeAiRacers();
 makeTrackPickups(trackCurve, lapLengthMeters);
+makeCoinPickups(trackCurve);
 const kart = makeKart();
 const startPose = getStartGridPose(checkpointPoints);
 kart.position.copy(startPose.position);
 let playerHeading = startPose.heading;
 kart.rotation.y = playerHeading;
 scene.add(kart);
+const playerBody = createKartChassisBody(startPose.position, playerHeading, kartPhysicsMaterial);
+physicsWorld.addBody(playerBody);
 let kartDriveState: ArcadeKartState = createArcadeKartState({
   heading: playerHeading,
 });
@@ -253,6 +291,7 @@ const minimap = createMiniMap();
 const speedGauge = createSpeedGauge();
 const controlsHint = createControlsHint();
 const audioButton = createAudioButton();
+const coinHud = createCoinHud();
 const engineAudio = createEngineAudio();
 
 // --- Wave 4: Powerup runtime + HUD ---
@@ -386,9 +425,6 @@ const startScreen = createStartScreen({
     pauseScreen.refresh();
     screenManager.goto("paused");
   },
-  onTracks: () => {
-    screenManager.goto("trackSelect");
-  },
 });
 document.body.appendChild(startScreen);
 screenManager.register("menu", startScreen);
@@ -446,16 +482,21 @@ screenManager.register("store", storeScreen);
 // Wave 4: show the powerup HUD only during the race phase.
 screenManager.setOnChange((phase) => {
   if (phase === "race") {
+    phaseBeforePause = "race";
     selectedPowerupId = pickDefaultSelectedPowerup();
     refreshPowerupHud();
+    updateCoinHud();
     if (gameSettings.showHud) {
       powerupHud.show();
+      coinHud.hidden = false;
     } else {
       powerupHud.hide();
+      coinHud.hidden = true;
     }
   } else {
     clearDrivingInput();
     powerupHud.hide();
+    coinHud.hidden = true;
     // Clear visual shield when leaving the race (effects stop ticking anyway).
     shieldBubble.visible = false;
     shieldActive = false;
@@ -482,9 +523,14 @@ renderer.setAnimationLoop((time) => {
     raceTimeSeconds = Math.max(0, raceTimeSeconds - deltaSeconds);
     updateKart(deltaSeconds);
     updateAiRacers(deltaSeconds);
+    physicsWorld.step(fixedPhysicsStep, deltaSeconds, maxPhysicsSubSteps);
+    syncKartFromPhysics(deltaSeconds);
+    handleBoostPads();
     updateBoostPads(deltaSeconds);
     updateCheckpoints();
     updatePowerups(performance.now(), deltaSeconds);
+    handleCoins();
+    updateCoins(deltaSeconds);
   }
 
   updateCamera(deltaSeconds);
@@ -839,6 +885,18 @@ function makeTrackVisual(points: readonly THREE.Vector3[]): void {
     curbRail.receiveShadow = true;
     scene.add(curbRail);
   }
+
+  addTrackRailColliders(points);
+}
+
+function addTrackRailColliders(points: readonly THREE.Vector3[]): void {
+  for (const spec of buildRailColliderSpecs(points, roadWidth)) {
+    addStaticBoxCollider(
+      spec.size,
+      spec.position,
+      new THREE.Euler(0, spec.rotationY, 0),
+    );
+  }
 }
 
 function addLaneDashes(points: readonly THREE.Vector3[]): void {
@@ -920,6 +978,90 @@ function makeTrackPickups(curve: THREE.CatmullRomCurve3, lapLength: number): voi
     pad.receiveShadow = true;
     scene.add(pad);
     boostPads.push({ position: base.clone(), cooldown: 0 });
+  }
+}
+
+/**
+ * Crumb Coin pickups — spinning gold discs placed along the track centerline.
+ * Up to MAX_COINS_PER_RACE coins, alternating sides. Each is a purely visual
+ * Three.js group (no physics body); collection is a distance check in
+ * handleCoins(). Coins use the track-stripe yellow (#f4d150) so they read as
+ * part of the track palette.
+ */
+function makeCoinPickups(curve: THREE.CatmullRomCurve3): void {
+  const coinGeo = new THREE.CylinderGeometry(0.48, 0.48, 0.1, 20);
+  const coinMat = new THREE.MeshStandardMaterial({
+    color: 0xf4d150,
+    emissive: 0xf4d150,
+    emissiveIntensity: 0.35,
+    metalness: 0.75,
+    roughness: 0.28,
+  });
+  // Inner ring detail (darker gold).
+  const ringGeo = new THREE.RingGeometry(0.22, 0.32, 20);
+  const ringMat = new THREE.MeshStandardMaterial({
+    color: 0xc9a23a,
+    metalness: 0.8,
+    roughness: 0.3,
+  });
+
+  for (const state of coinStates) {
+    const { progress, lateralOffset } = state.placement;
+    const base = curve.getPointAt(progress);
+    const tangent = curve.getTangentAt(progress).normalize();
+    const normal = new THREE.Vector3(-tangent.z, 0, tangent.x);
+    const pos = base.clone().addScaledVector(normal, lateralOffset);
+
+    const group = new THREE.Group();
+    // Disc: cylinder axis along Y by default → rotate X 90° so flat faces
+    // point forward/back (coin stands upright like a gold doubloon).
+    const disc = new THREE.Mesh(coinGeo, coinMat);
+    disc.rotation.x = Math.PI / 2;
+    disc.castShadow = true;
+    group.add(disc);
+
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.position.set(0, 0, 0.06);
+    ring.castShadow = true;
+    group.add(ring);
+    const ring2 = new THREE.Mesh(ringGeo, ringMat);
+    ring2.position.set(0, 0, -0.06);
+    group.add(ring2);
+
+    group.position.copy(pos);
+    group.position.y = 0.95;
+    scene.add(group);
+    coinMeshes.push({ mesh: group, disc });
+  }
+}
+
+/** Check kart proximity to each uncollected coin; collect on contact. */
+function handleCoins(): void {
+  for (let i = 0; i < coinStates.length; i += 1) {
+    const state = coinStates[i];
+    if (state.collected) continue;
+    const coinMesh = coinMeshes[i];
+    if (horizontalDistance(kart.position, coinMesh.mesh.position) < 2.0) {
+      state.collected = true;
+      coinMesh.mesh.visible = false;
+      coinsCollectedThisRace += 1;
+      // Award Crumb Coins to the persistent wallet + a score bonus.
+      addCoins(10);
+      score += 200;
+      updateCoinHud();
+    }
+  }
+}
+
+/** Spin the visible coin discs each frame. */
+function updateCoins(deltaSeconds: number): void {
+  const spinSpeed = 2.4;
+  for (let i = 0; i < coinStates.length; i += 1) {
+    if (coinStates[i].collected) continue;
+    coinMeshes[i].mesh.rotation.y += spinSpeed * deltaSeconds;
+    // Gentle vertical bob.
+    const bob = Math.sin(performance.now() * 0.003 + i * 0.7) * 0.08;
+    coinMeshes[i].mesh.position.y = 0.95 + bob;
   }
 }
 
@@ -1191,6 +1333,10 @@ function getKartForwardVector(): THREE.Vector3 {
   return new THREE.Vector3(-Math.sin(playerHeading), 0, -Math.cos(playerHeading));
 }
 
+function getPlayerBodyPosition(): THREE.Vector3 {
+  return new THREE.Vector3(playerBody.position.x, playerBody.position.y, playerBody.position.z);
+}
+
 function updateKart(deltaSeconds: number): void {
   const currentSection = getCurrentTrackSection();
   boostTimer = Math.max(0, boostTimer - deltaSeconds);
@@ -1214,18 +1360,44 @@ function updateKart(deltaSeconds: number): void {
 
   const speedRatio = THREE.MathUtils.clamp(Math.abs(raceState.speed) / vehicleConfig.boostSpeed, 0, 1);
 
-  kart.position.addScaledVector(getKartForwardVector(), raceState.speed * deltaSeconds);
-  kart.position.x = THREE.MathUtils.clamp(kart.position.x, -roomHalfWidth + 10, roomHalfWidth - 10);
-  kart.position.y = 0.42;
-  kart.position.z = THREE.MathUtils.clamp(kart.position.z, -roomHalfDepth + 10, roomHalfDepth - 10);
-  kart.rotation.y = playerHeading;
+  applyArcadeBodyVelocity(playerBody, playerHeading, raceState.speed, deltaSeconds);
+  playerBody.position.x = THREE.MathUtils.clamp(playerBody.position.x, -roomHalfWidth + 10, roomHalfWidth - 10);
+  playerBody.position.z = THREE.MathUtils.clamp(playerBody.position.z, -roomHalfDepth + 10, roomHalfDepth - 10);
   kart.rotation.z = THREE.MathUtils.lerp(
     kart.rotation.z,
     kartDriveState.steer * 0.17 * speedRatio + kartDriveState.drift * 0.08,
     1 - Math.exp(-10 * deltaSeconds),
   );
   constrainKartToRoad(deltaSeconds);
+}
 
+function syncKartFromPhysics(deltaSeconds: number): void {
+  playerBody.position.x = THREE.MathUtils.clamp(playerBody.position.x, -roomHalfWidth + 10, roomHalfWidth - 10);
+  playerBody.position.y = DEFAULT_ARCADE_PHYSICS_TUNING.chassisCenterY;
+  playerBody.position.z = THREE.MathUtils.clamp(playerBody.position.z, -roomHalfDepth + 10, roomHalfDepth - 10);
+  playerBody.velocity.y = 0;
+  playerBody.angularVelocity.x = 0;
+  playerBody.angularVelocity.z = 0;
+
+  kart.position.set(playerBody.position.x, DEFAULT_ARCADE_PHYSICS_TUNING.chassisCenterY, playerBody.position.z);
+  kart.rotation.y = playerHeading;
+
+  const forward = getKartForwardVector();
+  const actualForwardSpeed = playerBody.velocity.x * forward.x + playerBody.velocity.z * forward.z;
+  const actualHorizontalSpeed = Math.hypot(playerBody.velocity.x, playerBody.velocity.z);
+  const targetSpeed = Math.sign(raceState.speed || actualForwardSpeed || 1)
+    * Math.max(actualHorizontalSpeed, Math.abs(raceState.speed) * 0.45);
+
+  if (Math.abs(raceState.speed) > 8 && actualHorizontalSpeed < Math.abs(raceState.speed) * 0.52) {
+    raceState.speed = THREE.MathUtils.lerp(
+      raceState.speed,
+      targetSpeed,
+      1 - Math.exp(-7 * deltaSeconds),
+    );
+  }
+}
+
+function handleBoostPads(): void {
   for (const pad of boostPads) {
     if (pad.cooldown <= 0 && horizontalDistance(kart.position, pad.position) < 4.8) {
       boostTimer = 1.15;
@@ -1236,33 +1408,35 @@ function updateKart(deltaSeconds: number): void {
 }
 
 function constrainKartToRoad(deltaSeconds: number): void {
-  const nearest = getNearestTrackSample(kart.position);
+  const bodyPosition = getPlayerBodyPosition();
+  const nearest = getNearestTrackSample(bodyPosition);
   const section = getTrackSectionForSample(nearest.index);
-  const offset = kart.position.clone().sub(nearest.point);
+  const offset = bodyPosition.sub(nearest.point);
   const lateral = offset.dot(nearest.normal);
-  const edge = roadWidth * 0.46;
+  const edge = roadWidth * 0.48;
   const targetHeading = Math.atan2(-nearest.tangent.x, -nearest.tangent.z);
   const isSteering = input.left || input.right;
 
   if (Math.abs(lateral) > 0.15) {
-    const correctionRate = isSteering ? 0.04 * section.assistStrength : 0.55 * section.assistStrength;
+    const correctionRate = isSteering ? 0.03 * section.assistStrength : 0.32 * section.assistStrength;
     const correction = lateral * (1 - Math.exp(-correctionRate * deltaSeconds));
-    kart.position.addScaledVector(nearest.normal, -correction);
-    kart.position.y = 0.42;
+    playerBody.velocity.x += -nearest.normal.x * correction * 3.8;
+    playerBody.velocity.z += -nearest.normal.z * correction * 3.8;
   }
 
-  const correctedLateral = kart.position.clone().sub(nearest.point).dot(nearest.normal);
+  const correctedLateral = getPlayerBodyPosition().sub(nearest.point).dot(nearest.normal);
 
   if (Math.abs(correctedLateral) > edge) {
-    kart.position.copy(nearest.point).addScaledVector(nearest.normal, Math.sign(lateral) * edge);
-    kart.position.y = 0.42;
-    raceState.speed *= 0.985;
-    playerHeading = lerpAngle(playerHeading, targetHeading, 1 - Math.exp(-3.2 * deltaSeconds));
+    const inwardImpulse = (Math.abs(correctedLateral) - edge) * Math.sign(correctedLateral);
+    playerBody.velocity.x += -nearest.normal.x * inwardImpulse * 8.5;
+    playerBody.velocity.z += -nearest.normal.z * inwardImpulse * 8.5;
+    raceState.speed *= 0.94;
+    playerHeading = lerpAngle(playerHeading, targetHeading, 1 - Math.exp(-2.1 * deltaSeconds));
   } else if (!isSteering) {
     playerHeading = lerpAngle(playerHeading, targetHeading, 1 - Math.exp(-0.62 * section.assistStrength * deltaSeconds));
   }
 
-  kart.rotation.y = playerHeading;
+  playerBody.quaternion.setFromEuler(0, playerHeading, 0, "XYZ");
 }
 
 function getCurrentTrackSection(): TrackLayoutSection {
@@ -1353,9 +1527,15 @@ function makeAiRacers(): AiRacer[] {
     }));
     const row = Math.floor(index / 2) + 1;
     const lane = index % 2 === 0 ? -2.6 : 2.6;
-    const progress = THREE.MathUtils.euclideanModulo(1 - row * 0.008, 1);
+    const progress = THREE.MathUtils.euclideanModulo(0.035 + row * 0.018, 1);
+    const pose = getAiRacerPose(progress, lane);
+    group.position.copy(pose.position);
+    group.rotation.y = pose.heading;
+    const body = createAiKartBody(pose.position, pose.heading, kartPhysicsMaterial);
+    physicsWorld.addBody(body);
     racers.push({
       group,
+      body,
       progress,
       speed: 22 + index * 0.55,
       laneOffset: lane,
@@ -1391,6 +1571,19 @@ function makeAiKart(bodyMaterial: THREE.MeshStandardMaterial): THREE.Group {
   return group;
 }
 
+function getAiRacerPose(progress: number, laneOffset: number): { position: THREE.Vector3; heading: number } {
+  const point = trackCurve.getPointAt(progress);
+  const tangent = trackCurve.getTangentAt(progress).normalize();
+  const normal = new THREE.Vector3(-tangent.z, 0, tangent.x);
+  const position = point.clone().addScaledVector(normal, laneOffset);
+  position.y = DEFAULT_ARCADE_PHYSICS_TUNING.chassisCenterY;
+
+  return {
+    position,
+    heading: Math.atan2(-tangent.x, -tangent.z),
+  };
+}
+
 function updateAiRacers(deltaSeconds: number): void {
   for (const racer of aiRacers) {
     const playerDistanceAlongLap = estimatePlayerProgress() * lapLengthMeters;
@@ -1402,12 +1595,19 @@ function updateAiRacers(deltaSeconds: number): void {
       1,
     );
 
-    const point = trackCurve.getPointAt(racer.progress);
-    const tangent = trackCurve.getTangentAt(racer.progress).normalize();
-    const normal = new THREE.Vector3(-tangent.z, 0, tangent.x);
-    racer.group.position.copy(point).addScaledVector(normal, racer.laneOffset);
-    racer.group.position.y = 0.42;
-    racer.group.rotation.y = Math.atan2(-tangent.x, -tangent.z);
+    const previousX = racer.body.position.x;
+    const previousZ = racer.body.position.z;
+    const pose = getAiRacerPose(racer.progress, racer.laneOffset);
+    racer.group.position.copy(pose.position);
+    racer.group.rotation.y = pose.heading;
+    racer.body.position.set(pose.position.x, DEFAULT_ARCADE_PHYSICS_TUNING.chassisCenterY, pose.position.z);
+    racer.body.velocity.set(
+      (pose.position.x - previousX) / Math.max(deltaSeconds, 1 / 120),
+      0,
+      (pose.position.z - previousZ) / Math.max(deltaSeconds, 1 / 120),
+    );
+    racer.body.angularVelocity.set(0, 0, 0);
+    racer.body.quaternion.setFromEuler(0, pose.heading, 0, "XYZ");
   }
 }
 
@@ -1532,6 +1732,23 @@ function createControlsHint(): HTMLDivElement {
   return element;
 }
 
+function createCoinHud(): HTMLDivElement {
+  const element = document.createElement("div");
+  element.className = "coin-hud";
+  element.innerHTML =
+    '<span class="coin-hud__icon">◆</span>' +
+    `<span class="coin-hud__count">0/${MAX_COINS_PER_RACE}</span>`;
+  document.body.appendChild(element);
+  return element;
+}
+
+function updateCoinHud(): void {
+  const countEl = coinHud.querySelector(".coin-hud__count");
+  if (countEl) {
+    countEl.textContent = `${coinsCollectedThisRace}/${MAX_COINS_PER_RACE}`;
+  }
+}
+
 function createAudioButton(): HTMLButtonElement {
   const button = document.createElement("button");
   button.className = "audio-button";
@@ -1635,11 +1852,18 @@ function resetRaceForNextRace(): void {
   for (const pad of boostPads) {
     pad.cooldown = 0;
   }
+  resetCoinStates(coinStates);
+  coinsCollectedThisRace = 0;
+  updateCoinHud();
+  for (const coinMesh of coinMeshes) {
+    coinMesh.mesh.visible = true;
+  }
   const pose = getStartGridPose(checkpointPoints);
   kart.position.copy(pose.position);
   playerHeading = pose.heading;
   kart.rotation.y = playerHeading;
   kart.rotation.z = 0;
+  resetBodyPose(playerBody, pose.position, playerHeading);
   kartDriveState = createArcadeKartState({ heading: playerHeading });
 }
 

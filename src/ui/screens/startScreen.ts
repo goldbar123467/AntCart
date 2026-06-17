@@ -8,8 +8,6 @@ export interface StartScreenOptions {
   onStart: () => void;
   onStore: () => void;
   onOptions: () => void;
-  /** Wave 5: open the track-select screen. Optional for backward compat. */
-  onTracks?: () => void;
 }
 
 const ANTHILL_CREST_SVG = `
@@ -78,7 +76,6 @@ export function createStartScreen(options: StartScreenOptions): HTMLDivElement {
       <div class="ac-start__buttons">
         <button class="ac-btn ac-btn--primary" type="button" data-action="start">Start Race</button>
         <div class="ac-start__secondary">
-          <button class="ac-btn ac-btn--secondary" type="button" data-action="tracks">Tracks</button>
           <button class="ac-btn ac-btn--secondary" type="button" data-action="store">Store</button>
           <button class="ac-btn ac-btn--secondary" type="button" data-action="options">Options</button>
         </div>
@@ -92,18 +89,12 @@ export function createStartScreen(options: StartScreenOptions): HTMLDivElement {
   `.trim();
 
   const startButton = overlay.querySelector<HTMLButtonElement>('[data-action="start"]');
-  const tracksButton = overlay.querySelector<HTMLButtonElement>('[data-action="tracks"]');
   const storeButton = overlay.querySelector<HTMLButtonElement>('[data-action="store"]');
   const optionsButton = overlay.querySelector<HTMLButtonElement>('[data-action="options"]');
 
   startButton?.addEventListener("click", options.onStart);
   storeButton?.addEventListener("click", options.onStore);
   optionsButton?.addEventListener("click", options.onOptions);
-  if (options.onTracks) {
-    tracksButton?.addEventListener("click", options.onTracks);
-  } else {
-    tracksButton?.remove();
-  }
 
   return overlay;
 }

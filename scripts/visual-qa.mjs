@@ -53,11 +53,13 @@ async function readPageState(page) {
     const activeScreens = [...document.querySelectorAll(".ac-screen.is-active")]
       .map((node) => [...node.classList].filter((name) => name !== "ac-screen" && name !== "is-active"))
       .flat();
+    const hasTrackListButton = document.querySelector(".ac-start [data-action='tracks']") !== null;
 
     return {
       debug,
       gaugeText,
       activeScreens,
+      hasTrackListButton,
       viewport: {
         width: window.innerWidth,
         height: window.innerHeight,
@@ -177,16 +179,6 @@ async function runScenario(browser, scenario) {
   await captureScreenshot(page, screenshots, `${scenario.name}-landing`);
   const afterLanding = await readPageState(page);
 
-  await clickSelector(page, ".ac-start [data-action='tracks']");
-  await page.waitForFunction(() => {
-    return document.querySelector(".ac-track-select.is-active .ac-track-card") !== null;
-  }, { timeout: 10000 });
-  await captureScreenshot(page, screenshots, `${scenario.name}-track-select`);
-  const afterTrackSelect = await readPageState(page);
-
-  await clickSelector(page, ".ac-track-select [data-action='back']");
-  await page.waitForFunction(() => window.antcartsDebug?.().phase === "menu", { timeout: 10000 });
-
   await clickSelector(page, ".ac-start [data-action='options']");
   await page.waitForFunction(() => window.antcartsDebug?.().phase === "paused", { timeout: 10000 });
   await captureScreenshot(page, screenshots, `${scenario.name}-options`);
@@ -209,7 +201,7 @@ async function runScenario(browser, scenario) {
   await captureScreenshot(page, screenshots, `${scenario.name}-paused-race`);
   const afterPausedRace = await readPageState(page);
 
-  await page.keyboard.press("Escape");
+  await clickSelector(page, ".ac-pause [data-action='resume']");
   await page.waitForFunction(() => window.antcartsDebug?.().phase === "race", { timeout: 10000 });
 
   await holdKeys(page, ["KeyW", "KeyD"], Math.round(scenario.driveMs * 0.75));
@@ -233,7 +225,6 @@ async function runScenario(browser, scenario) {
     screenshots,
     states: {
       afterLanding,
-      afterTrackSelect,
       afterOptions,
       afterRaceStart,
       afterLeftTurn,
@@ -338,8 +329,8 @@ for (const scenario of scenarios) {
     failures.push(`${scenario.name}: landing did not start in menu phase`);
   }
 
-  if (!scenario.states.afterTrackSelect.activeScreens.includes("ac-track-select")) {
-    failures.push(`${scenario.name}: track-select screen did not become active`);
+  if (scenario.states.afterLanding.hasTrackListButton) {
+    failures.push(`${scenario.name}: removed track-list button is still visible`);
   }
 
   if (scenario.states.afterOptions.debug?.phase !== "paused") {
