@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { buildOffsetPathPoints } from "./trackOffset";
 
 export function buildRoadSurfaceGeometry(
   centerline: readonly THREE.Vector3[],
@@ -11,20 +12,21 @@ export function buildRoadSurfaceGeometry(
   const indices: number[] = [];
   const distances = getCumulativeDistances(centerline);
   const totalDistance = distances[distances.length - 1] + centerline.at(-1)!.distanceTo(centerline[0]);
+  const leftEdge = buildOffsetPathPoints(centerline, 1, roadWidth * 0.5, {
+    y: 0.055,
+  });
+  const rightEdge = buildOffsetPathPoints(centerline, -1, roadWidth * 0.5, {
+    y: 0.055,
+  });
 
   for (let i = 0; i < centerline.length; i += 1) {
-    const previous = centerline[THREE.MathUtils.euclideanModulo(i - 1, centerline.length)];
-    const current = centerline[i];
-    const next = centerline[(i + 1) % centerline.length];
-    const tangent = new THREE.Vector3().subVectors(next, previous).normalize();
-    const normal = new THREE.Vector3(-tangent.z, 0, tangent.x);
-    const left = current.clone().addScaledVector(normal, roadWidth * 0.5);
-    const right = current.clone().addScaledVector(normal, roadWidth * -0.5);
+    const left = leftEdge[i];
+    const right = rightEdge[i];
     const leftIndex = i * 2;
     const rightIndex = leftIndex + 1;
 
-    writeVertex(positions, leftIndex, left.x, 0.055, left.z);
-    writeVertex(positions, rightIndex, right.x, 0.055, right.z);
+    writeVertex(positions, leftIndex, left.x, left.y, left.z);
+    writeVertex(positions, rightIndex, right.x, right.y, right.z);
     writeVertex(normals, leftIndex, 0, 1, 0);
     writeVertex(normals, rightIndex, 0, 1, 0);
     uvs[leftIndex * 2] = distances[i] / Math.max(1, totalDistance);

@@ -48,7 +48,7 @@ import {
   type CoinState,
   MAX_COINS_PER_RACE,
 } from "./game/coinPickups";
-import { getPowerupStock } from "./game/economy/inventory";
+import { addPowerup, getPowerupStock, loadInventory } from "./game/economy/inventory";
 import {
   createPowerupRunner,
   type PowerupContext,
@@ -72,7 +72,6 @@ import {
   type AchievementToaster,
 } from "./ui/hud/achievements";
 import { loadSettings, updateSettings, type GameSettings } from "./game/settings";
-import { loadInventory } from "./game/economy/inventory";
 import "./style.css";
 
 interface Checkpoint {
@@ -88,6 +87,14 @@ interface EngineAudio {
   setMuted: (muted: boolean) => void;
 }
 
+type SfxKind = "coin" | "mysteryBox" | "powerup";
+
+interface GameSfx {
+  start: () => Promise<void>;
+  play: (kind: SfxKind) => void;
+  setMuted: (muted: boolean) => void;
+}
+
 interface AiRacer {
   group: THREE.Group;
   body: CANNON.Body;
@@ -98,6 +105,11 @@ interface AiRacer {
 
 interface BoostPad {
   position: THREE.Vector3;
+  cooldown: number;
+}
+
+interface MysteryBox {
+  mesh: THREE.Mesh;
   cooldown: number;
 }
 
@@ -163,7 +175,19 @@ const roomHalfWidth = 230;
 const roomHalfDepth = 160;
 const roomWallHeight = 45;
 const totalRaceLaps = 3;
+const SFX_SOURCES: Record<SfxKind, string> = {
+  coin: "/audio/coin.ogg",
+  mysteryBox: "/audio/mystery-box.ogg",
+  powerup: "/audio/powerup.ogg",
+};
+const SFX_GAIN: Record<SfxKind, number> = {
+  coin: 0.78,
+  mysteryBox: 0.64,
+  powerup: 0.72,
+};
 const boostPads: BoostPad[] = [];
+const mysteryBoxes: MysteryBox[] = [];
+const mysteryBoxRespawnSeconds = 9;
 
 // --- Crumb Coin pickups (up to 15 per race) ---
 interface CoinMesh {
@@ -293,6 +317,7 @@ const controlsHint = createControlsHint();
 const audioButton = createAudioButton();
 const coinHud = createCoinHud();
 const engineAudio = createEngineAudio();
+const sfxAudio = createGameSfx();
 
 // --- Wave 4: Powerup runtime + HUD ---
 // The runner is the single source of truth for active effects and per-frame
@@ -348,6 +373,7 @@ document.body.appendChild(achievementToaster.element);
 
 function applyGameSettings(): void {
   engineAudio.setMuted(!gameSettings.engineAudio);
+  sfxAudio.setMuted(!gameSettings.engineAudio);
   const hudVisible = gameSettings.showHud;
   hud.style.display = hudVisible ? "" : "none";
   minimap.style.display = hudVisible ? "" : "none";
@@ -527,6 +553,7 @@ renderer.setAnimationLoop((time) => {
     syncKartFromPhysics(deltaSeconds);
     handleBoostPads();
     updateBoostPads(deltaSeconds);
+    handleMysteryBoxes(deltaSeconds);
     updateCheckpoints();
     updatePowerups(performance.now(), deltaSeconds);
     handleCoins();
@@ -956,6 +983,7 @@ function makeTrackPickups(curve: THREE.CatmullRomCurve3, lapLength: number): voi
       itemBox.rotation.y = Math.PI * 0.25;
       itemBox.castShadow = true;
       scene.add(itemBox);
+      mysteryBoxes.push({ mesh: itemBox, cooldown: 0 });
     }
   }
 
@@ -979,6 +1007,44 @@ function makeTrackPickups(curve: THREE.CatmullRomCurve3, lapLength: number): voi
     scene.add(pad);
     boostPads.push({ position: base.clone(), cooldown: 0 });
   }
+}
+
+function handleMysteryBoxes(deltaSeconds: number): void {
+  for (const box of mysteryBoxes) {
+    if (box.cooldown > 0) {
+      box.cooldown = Math.max(0, box.cooldown - deltaSeconds);
+
+      if (box.cooldown === 0) {
+        box.mesh.visible = true;
+      }
+    }
+
+    if (!box.mesh.visible) {
+      continue;
+    }
+
+    box.mesh.rotation.y += deltaSeconds * 2.4;
+
+    if (horizontalDistance(kart.position, box.mesh.position) < 2.35) {
+      box.mesh.visible = false;
+      box.cooldown = mysteryBoxRespawnSeconds;
+      grantMysteryBoxPowerup();
+      sfxAudio.play("mysteryBox");
+      score += 150;
+    }
+  }
+}
+
+function grantMysteryBoxPowerup(): void {
+  const powerupId = POWERUP_IDS[Math.floor(Math.random() * POWERUP_IDS.length)];
+  addPowerup(powerupId, 1);
+  const selectedStock = selectedPowerupId ? (getPowerupStock()[selectedPowerupId] ?? 0) : 0;
+
+  if (selectedPowerupId === null || selectedStock <= 0) {
+    selectedPowerupId = powerupId;
+  }
+
+  refreshPowerupHud();
 }
 
 /**
@@ -1049,6 +1115,7 @@ function handleCoins(): void {
       addCoins(10);
       score += 200;
       updateCoinHud();
+      sfxAudio.play("coin");
     }
   }
 }
@@ -1197,10 +1264,14 @@ function activateSelectedPowerup(): void {
   if (!result.ok) {
     // Out of stock — drop selection and re-pick the next available item.
     selectedPowerupId = pickDefaultSelectedPowerup();
-  } else if (activatedPowerupId === "powerup-sugar-cube-boost") {
-    unlockAchievement("sugar-rush");
-  } else if (activatedPowerupId === "powerup-leaf-shield") {
-    unlockAchievement("formic-defender");
+  } else {
+    sfxAudio.play("powerup");
+
+    if (activatedPowerupId === "powerup-sugar-cube-boost") {
+      unlockAchievement("sugar-rush");
+    } else if (activatedPowerupId === "powerup-leaf-shield") {
+      unlockAchievement("formic-defender");
+    }
   }
   // Instant offense effects return a spawn request the host may render.
   // Wave 4: no projectile rendering yet — consume + toast only.
@@ -1758,6 +1829,95 @@ function createAudioButton(): HTMLButtonElement {
   return button;
 }
 
+let sharedAudioContext: AudioContext | undefined;
+
+function getSharedAudioContext(): AudioContext {
+  sharedAudioContext ??= new AudioContext();
+  return sharedAudioContext;
+}
+
+function createGameSfx(): GameSfx {
+  let context: AudioContext | undefined;
+  let master: GainNode | undefined;
+  let loading: Promise<void> | undefined;
+  const buffers = new Map<SfxKind, AudioBuffer>();
+  let muted = false;
+
+  function ensureContext(): AudioContext {
+    if (!context) {
+      context = getSharedAudioContext();
+      master = context.createGain();
+      master.gain.value = muted ? 0 : 1;
+      master.connect(context.destination);
+    }
+
+    return context;
+  }
+
+  async function loadBuffers(): Promise<void> {
+    const audioContext = ensureContext();
+    const entries = await Promise.all(
+      (Object.entries(SFX_SOURCES) as Array<[SfxKind, string]>).map(async ([kind, url]) => {
+        const response = await fetch(url);
+
+        if (!response.ok) {
+          throw new Error(`Could not load ${url}: ${response.status}`);
+        }
+
+        const data = await response.arrayBuffer();
+        return [kind, await audioContext.decodeAudioData(data)] as const;
+      }),
+    );
+
+    for (const [kind, buffer] of entries) {
+      buffers.set(kind, buffer);
+    }
+  }
+
+  async function start(): Promise<void> {
+    const audioContext = ensureContext();
+
+    if (!loading) {
+      loading = loadBuffers().catch((error) => {
+        console.warn("AntCarts SFX failed to load.", error);
+      });
+    }
+
+    await audioContext.resume();
+    await loading;
+  }
+
+  return {
+    start,
+    play: (kind) => {
+      void start().then(() => {
+        if (!context || !master || muted) {
+          return;
+        }
+
+        const buffer = buffers.get(kind);
+        if (!buffer) {
+          return;
+        }
+
+        const source = context.createBufferSource();
+        const gain = context.createGain();
+        gain.gain.value = SFX_GAIN[kind];
+        source.buffer = buffer;
+        source.connect(gain).connect(master);
+        source.start();
+      });
+    },
+    setMuted: (value) => {
+      muted = value;
+
+      if (context && master) {
+        master.gain.setTargetAtTime(muted ? 0 : 1, context.currentTime, 0.025);
+      }
+    },
+  };
+}
+
 function createEngineAudio(): EngineAudio {
   let context: AudioContext | undefined;
   let oscillator: OscillatorNode | undefined;
@@ -1768,7 +1928,7 @@ function createEngineAudio(): EngineAudio {
   return {
     start: async () => {
       if (!context) {
-        context = new AudioContext();
+        context = getSharedAudioContext();
         oscillator = context.createOscillator();
         gain = context.createGain();
         oscillator.type = "sawtooth";
@@ -1803,6 +1963,7 @@ function createEngineAudio(): EngineAudio {
 async function startEngineAudio(): Promise<void> {
   try {
     await engineAudio.start();
+    void sfxAudio.start();
     audioButton.textContent = "Engine audio on";
     audioButton.classList.add("active");
   } catch {
@@ -1851,6 +2012,10 @@ function resetRaceForNextRace(): void {
   }
   for (const pad of boostPads) {
     pad.cooldown = 0;
+  }
+  for (const box of mysteryBoxes) {
+    box.cooldown = 0;
+    box.mesh.visible = true;
   }
   resetCoinStates(coinStates);
   coinsCollectedThisRace = 0;

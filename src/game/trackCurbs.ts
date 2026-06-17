@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { buildOffsetPathPoints } from "./trackOffset";
 import { TRACK_RAIL_CONFIG } from "./trackVisualConfig";
 
 export interface CurbBlockPose {
@@ -11,17 +12,14 @@ export function buildCurbPathPoints(
   side: -1 | 1,
   roadWidth: number,
 ): THREE.Vector3[] {
-  return centerline.map((point, index) => {
-    const previous = centerline[THREE.MathUtils.euclideanModulo(index - 1, centerline.length)];
-    const next = centerline[(index + 1) % centerline.length];
-    const tangent = new THREE.Vector3().subVectors(next, previous).normalize();
-    const normal = new THREE.Vector3(-tangent.z, 0, tangent.x);
-
-    return point
-      .clone()
-      .addScaledVector(normal, side * (roadWidth * 0.5 + TRACK_RAIL_CONFIG.sideGap))
-      .setY(TRACK_RAIL_CONFIG.centerY);
-  });
+  return buildOffsetPathPoints(
+    centerline,
+    side,
+    roadWidth * 0.5 + TRACK_RAIL_CONFIG.sideGap,
+    {
+      y: TRACK_RAIL_CONFIG.centerY,
+    },
+  );
 }
 
 export class ClosedPolylineCurve3 extends THREE.Curve<THREE.Vector3> {
@@ -68,8 +66,12 @@ export class ClosedPolylineCurve3 extends THREE.Curve<THREE.Vector3> {
   }
 }
 
-export function buildClosedCurbCurve(points: readonly THREE.Vector3[]): ClosedPolylineCurve3 {
-  return new ClosedPolylineCurve3(points);
+export function buildClosedCurbCurve(points: readonly THREE.Vector3[]): THREE.CatmullRomCurve3 {
+  return new THREE.CatmullRomCurve3(
+    points.map((point) => point.clone()),
+    true,
+    "centripetal",
+  );
 }
 
 export function getMaxCurbSampleGap(curve: THREE.Curve<THREE.Vector3>, sampleCount: number): number {
