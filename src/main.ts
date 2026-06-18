@@ -11,6 +11,7 @@ import {
 } from "./game/arcadeKart";
 import { createRaceState } from "./game/raceState";
 import { getSpeedGaugeState } from "./game/speedGauge";
+import { applyAiPowerupSpeedMultiplier } from "./game/aiPowerupSpeed";
 import { buildClosedCurbCurve, buildCurbPathPoints } from "./game/trackCurbs";
 import { createFinishLineGroup } from "./game/finishLine";
 import { buildRoadSurfaceGeometry } from "./game/trackSurface";
@@ -100,6 +101,7 @@ interface AiRacer {
   group: THREE.Group;
   body: CANNON.Body;
   progress: number;
+  baseSpeed: number;
   speed: number;
   laneOffset: number;
 }
@@ -581,6 +583,7 @@ renderer.setAnimationLoop((time) => {
     boostTimer: number;
     sectionKind: string;
     position: { x: number; z: number };
+    aiSpeeds: { speed: number; baseSpeed: number }[];
   };
 }).antcartsDebug = () => ({
   phase: screenManager.current,
@@ -596,6 +599,10 @@ renderer.setAnimationLoop((time) => {
     x: Number(kart.position.x.toFixed(2)),
     z: Number(kart.position.z.toFixed(2)),
   },
+  aiSpeeds: aiRacers.map((racer) => ({
+    speed: Number(racer.speed.toFixed(3)),
+    baseSpeed: Number(racer.baseSpeed.toFixed(3)),
+  })),
 });
 
 function getRaceSeed(): number {
@@ -1315,12 +1322,9 @@ function updatePowerups(now: number, deltaSeconds: number): void {
     boostTimer = Math.max(boostTimer, 0.12);
   }
 
-  // AI slow: scale each AI racer's speed this frame (no physics body change).
-  if (delta.aiSpeedMultiplier < 1) {
-    for (const racer of aiRacers) {
-      racer.speed *= delta.aiSpeedMultiplier;
-    }
-  }
+  // AI slow/freeze: derive current speed from immutable base speed each frame
+  // so timed effects cannot compound and leave racers permanently stopped.
+  applyAiPowerupSpeedMultiplier(aiRacers, delta.aiSpeedMultiplier);
 
   // Score bonus (magnet accrual).
   if (delta.scoreBonus > 0) {
@@ -1589,12 +1593,14 @@ function makeAiRacers(): AiRacer[] {
     group.position.copy(pose.position);
     group.rotation.y = pose.heading;
     const body = createAiKartBody(pose.position, pose.heading, kartPhysicsMaterial);
+    const baseSpeed = 22 + index * 0.55;
     physicsWorld.addBody(body);
     racers.push({
       group,
       body,
       progress,
-      speed: 22 + index * 0.55,
+      baseSpeed,
+      speed: baseSpeed,
       laneOffset: lane,
     });
     scene.add(group);
